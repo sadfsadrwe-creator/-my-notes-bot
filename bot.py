@@ -2,11 +2,18 @@ import json
 import os
 import logging
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     filters,
     ContextTypes,
@@ -20,9 +27,9 @@ MEDIA_DIR = os.path.join(BASE_DIR, "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 WAITING_TEXT = 1
-WAITING_DELETE_NUM = 2
-WAITING_CLEAR_TYPE = 3
-WAITING_CLEAR_ALL = 4
+WAITING_VIEW_NUM = 2
+WAITING_DELETE_NUM = 3
+WAITING_CLEAR_TYPE = 4
 
 TYPES = {
     "text": "📝 Текст",
@@ -65,12 +72,9 @@ def menu():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📋 Все"), KeyboardButton("📊 По категориям")],
-            [KeyboardButton("📝 Текст"), KeyboardButton("🖼 Фото")],
-            [KeyboardButton("🎬 Видео"), KeyboardButton("🎤 Голосовые")],
-            [KeyboardButton("⭕ Кружки"), KeyboardButton("📄 Файлы")],
-            [KeyboardButton("🎵 Аудио"), KeyboardButton("😀 Стикеры")],
-            [KeyboardButton("🗑 Удалить"), KeyboardButton("🧹 Очистить")],
-            [KeyboardButton("💾 Экспорт"), KeyboardButton("ℹ️ Помощь")],
+            [KeyboardButton("👀 Посмотреть"), KeyboardButton("🗑 Удалить")],
+            [KeyboardButton("🧹 Очистить"), KeyboardButton("💾 Экспорт")],
+            [KeyboardButton("ℹ️ Помощь")],
         ],
         resize_keyboard=True,
     )
@@ -104,13 +108,11 @@ async def start(update: Update, ctx):
 
 async def help_cmd(update: Update, ctx):
     await update.message.reply_text(
-        "Кидай сюда фото, видео, кружки, голосовые, файлы, стикеры — я сам рассортирую.\n\n"
-        "📋 Все — весь список\n"
-        "📊 По категориям — сколько в каждом разделе\n"
-        "Любая кнопка категории — показать что там\n"
-        "🗑 Удалить — удалить по номеру\n"
-        "🧹 Очистить — удалить всё из раздела или всё сразу\n"
-        "💾 Экспорт — скачать текстовый файл",
+        "Кидай фото, видео, кружки, голосовые, файлы — я рассортирую.\n\n"
+        "👀 Посмотреть — введи номер и я пришлю файл\n"
+        "🗑 Удалить — удали по номеру\n"
+        "🧹 Очистить — удалить по категориям\n"
+        "💾 Экспорт — скачать текстом",
         reply_markup=menu(),
     )
     return ConversationHandler.END
@@ -127,15 +129,11 @@ async def _save(update, ctx, note_type, file_id=None, file_ext="", text=""):
         "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
     }
     if file_id:
-        tg_file = await (await ctx.bot.get_file(file_id)).download_to_drive(
-            custom_path=os.path.join(MEDIA_DIR, f"{uid}_{num}{file_ext}")
-        )
-        note["file_path"] = str(tg_file)
         note["file_id"] = file_id
     notes.append(note)
     save_user(uid, notes)
     label = TYPES.get(note_type, note_type)
-    await update.message.reply_text(f"✅ {label} #{num} сохранён", reply_markup=menu())
+    await update.message.reply_text(f"✅ {label} #{num}", reply_markup=menu())
 
 
 async def save_text_start(update, ctx):
@@ -155,9 +153,7 @@ async def save_text(update, ctx):
         }
     )
     save_user(uid, notes)
-    await update.message.reply_text(
-        f"✅ Текст #{len(notes)} сохранён", reply_markup=menu()
-    )
+    await update.message.reply_text(f"✅ Текст #{len(notes)}", reply_markup=menu())
     return ConversationHandler.END
 
 
@@ -220,19 +216,6 @@ async def save_gif(update, ctx):
     await _save(update, ctx, "animation", update.message.animation.file_id, ".mp4")
 
 
-async def show_section(update, ctx, note_type):
-    uid = str(update.effective_user.id)
-    filtered = [n for n in get_notes(uid) if n["type"] == note_type]
-    label = TYPES.get(note_type, note_type)
-    if not filtered:
-        await update.message.reply_text(f"📭 {label} пусто", reply_markup=menu())
-        return
-    lines = [f"#{n['id']} | {n['created']} | {n['text'][:25]}" for n in filtered]
-    await update.message.reply_text(
-        f"{label} ({len(filtered)}):\n\n" + "\n".join(lines), reply_markup=menu()
-    )
-
-
 async def show_all(update, ctx):
     uid = str(update.effective_user.id)
     notes = get_notes(uid)
@@ -270,6 +253,63 @@ async def show_categories(update, ctx):
     )
 
 
+async def view_start(update, ctx):
+    uid = str(update.effective_user.id)
+    notes = get_notes(uid)
+    if not notes:
+        await update.message.reply_text("📭 Нечего смотреть", reply_markup=menu())
+        return ConversationHandler.END
+    lines = [f"#{n['id']} {TYPES.get(n['type'], '')} {n['text'][:20]}" for n in notes]
+    await update.message.reply_text("Введи номер:\n\n" + "\n".join(lines))
+    return WAITING_VIEW_NUM
+
+
+async def view_note(update, ctx):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Введи число:", reply_markup=menu())
+        return WAITING_VIEW_NUM
+    nid = int(text)
+    uid = str(update.effective_user.id)
+    note = next((n for n in get_notes(uid) if n["id"] == nid), None)
+    if not note:
+        await update.message.reply_text(f"❌ #{nid} не найден", reply_markup=menu())
+        return ConversationHandler.END
+
+    file_id = note.get("file_id")
+    note_type = note["type"]
+    caption = note["text"] if note["text"] else None
+
+    try:
+        if note_type == "photo" and file_id:
+            await update.message.reply_photo(photo=file_id, caption=caption)
+        elif note_type == "video" and file_id:
+            await update.message.reply_video(video=file_id, caption=caption)
+        elif note_type == "voice" and file_id:
+            await update.message.reply_voice(voice=file_id)
+        elif note_type == "video_note" and file_id:
+            await update.message.reply_video_note(video_note=file_id)
+        elif note_type == "audio" and file_id:
+            await update.message.reply_audio(audio=file_id, caption=caption)
+        elif note_type == "document" and file_id:
+            await update.message.reply_document(document=file_id, caption=caption)
+        elif note_type == "sticker" and file_id:
+            await update.message.reply_sticker(sticker=file_id)
+        elif note_type == "animation" and file_id:
+            await update.message.reply_animation(animation=file_id)
+        elif note_type == "text":
+            await update.message.reply_text(f"📝 #{nid}:\n\n{note['text']}")
+        else:
+            await update.message.reply_text(f"❌ Файл не найден")
+    except Exception:
+        await update.message.reply_text(
+            f"❌ Не удалось отправить #{nid}", reply_markup=menu()
+        )
+
+    await update.message.reply_text("Готово", reply_markup=menu())
+    return ConversationHandler.END
+
+
 async def delete_start(update, ctx):
     uid = str(update.effective_user.id)
     notes = get_notes(uid)
@@ -293,8 +333,6 @@ async def delete_note(update, ctx):
     if not target:
         await update.message.reply_text(f"❌ #{nid} не найден", reply_markup=menu())
         return ConversationHandler.END
-    if "file_path" in target and os.path.exists(target["file_path"]):
-        os.remove(target["file_path"])
     save_user(uid, [n for n in notes if n["id"] != nid])
     await update.message.reply_text(f"🗑 #{nid} удалён", reply_markup=menu())
     return ConversationHandler.END
@@ -318,9 +356,6 @@ async def clear_type(update, ctx):
         if not notes:
             await update.message.reply_text("📭 И так пусто", reply_markup=menu())
             return ConversationHandler.END
-        for n in notes:
-            if "file_path" in n and os.path.exists(n["file_path"]):
-                os.remove(n["file_path"])
         save_user(uid, [])
         await update.message.reply_text(
             f"🧹 Всё удалено ({len(notes)})", reply_markup=menu()
@@ -345,9 +380,6 @@ async def clear_type(update, ctx):
         if not to_del:
             await update.message.reply_text("📭 Уже пусто", reply_markup=menu())
             return ConversationHandler.END
-        for n in to_del:
-            if "file_path" in n and os.path.exists(n["file_path"]):
-                os.remove(n["file_path"])
         save_user(uid, [n for n in notes if n["type"] != note_type])
         label = TYPES.get(note_type, note_type)
         await update.message.reply_text(
@@ -387,12 +419,12 @@ async def export_notes(update, ctx):
 
 async def button_handler(update, ctx):
     t = update.message.text
-    if t in TYPE_BUTTONS:
-        return await show_section(update, ctx, TYPE_BUTTONS[t])
     if t == "📋 Все":
         return await show_all(update, ctx)
     if t == "📊 По категориям":
         return await show_categories(update, ctx)
+    if t == "👀 Посмотреть":
+        return await view_start(update, ctx)
     if t == "🗑 Удалить":
         return await delete_start(update, ctx)
     if t == "🧹 Очистить":
@@ -406,6 +438,16 @@ async def button_handler(update, ctx):
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     app = Application.builder().token(TOKEN).build()
+
+    view_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^👀 Посмотреть$"), view_start)],
+        states={
+            WAITING_VIEW_NUM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, view_note)
+            ]
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
 
     del_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🗑 Удалить$"), delete_start)],
@@ -437,6 +479,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(text_conv)
+    app.add_handler(view_conv)
     app.add_handler(del_conv)
     app.add_handler(clear_conv)
     app.add_handler(MessageHandler(filters.PHOTO, save_photo))
